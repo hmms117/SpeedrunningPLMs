@@ -11,6 +11,20 @@ from model.attention import SelfAttention, MultiHeadPAttention
 from model.utils import norm, MLP
 
 
+class CrossStitch(nn.Module):
+    """Cross-Stitch layer for multi-head feature sharing."""
+
+    def __init__(self, num_heads: int):
+        super().__init__()
+        self.alpha = nn.Parameter(torch.eye(num_heads))
+
+    def forward(self, features: List[torch.Tensor]) -> List[torch.Tensor]:
+        # features: list of tensors with shape (B, H)
+        stacked = torch.stack(features, dim=1)  # (B, num_heads, H)
+        mixed = torch.einsum("ij,bjh->bih", self.alpha, stacked)
+        return [mixed[:, i] for i in range(len(features))]
+
+
 @dataclass
 class PLMConfig(PretrainedConfig):
     def __init__(
@@ -26,6 +40,8 @@ class PLMConfig(PretrainedConfig):
         sliding_window_size: int = 2048,
         p_attention: bool = False,
         tie_embeddings: bool = False,
+        property_prediction: bool = False,
+        use_cross_stitch: bool = False,
     ):
         self.hidden_size = hidden_size
         self.num_attention_heads = num_attention_heads
@@ -38,6 +54,8 @@ class PLMConfig(PretrainedConfig):
         self.sliding_window_size = sliding_window_size
         self.p_attention = p_attention
         self.tie_embeddings = tie_embeddings
+        self.property_prediction = property_prediction
+        self.use_cross_stitch = use_cross_stitch
 
 
 @dataclass
@@ -45,6 +63,7 @@ class ESMOutput(ModelOutput):
     loss: Optional[torch.Tensor] = None
     logits: Optional[torch.Tensor] = None
     last_hidden_state: Optional[torch.Tensor] = None
+    properties: Optional[dict] = None
 
 
 class LMHead(nn.Module):
@@ -61,6 +80,57 @@ class LMHead(nn.Module):
         x = self.act(x)
         x = self.decoder(x) + self.bias
         return self.soft_logit_cap * torch.tanh(x / self.soft_logit_cap)
+
+
+class TwoLayerHead(nn.Module):
+    """Two-layer MLP with GELU activation and layer normalization."""
+
+    def __init__(self, hidden_size: int):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(hidden_size)
+        self.fc1 = nn.Linear(hidden_size, hidden_size)
+        self.act = nn.GELU()
+        self.fc2 = nn.Linear(hidden_size, 1)
+        self.ln2 = nn.LayerNorm(1)
+
+    def forward_first(self, x: torch.Tensor) -> torch.Tensor:
+        return self.act(self.fc1(self.ln1(x)))
+
+    def forward_second(self, x: torch.Tensor) -> torch.Tensor:
+        return self.ln2(self.fc2(x)).squeeze(-1)
+
+
+class PropertyPredictor(nn.Module):
+    """Container for property-specific heads with optional cross-stitch."""
+
+    def __init__(self, hidden_size: int, use_cross_stitch: bool = False):
+        super().__init__()
+        self.use_cross_stitch = use_cross_stitch
+        self.expression = TwoLayerHead(hidden_size)
+        self.stability = TwoLayerHead(hidden_size)
+        self.activity = TwoLayerHead(hidden_size)
+        if use_cross_stitch:
+            self.cross = CrossStitch(3)
+
+    def forward(self, x: torch.Tensor) -> dict:
+        # x: (B, H)
+        f_exp = self.expression.forward_first(x)
+        f_stab = self.stability.forward_first(x)
+        f_act = self.activity.forward_first(x)
+
+        if self.use_cross_stitch:
+            f_exp, f_stab, f_act = self.cross([f_exp, f_stab, f_act])
+
+        out_exp = self.expression.forward_second(f_exp)
+        out_stab = self.stability.forward_second(f_stab)
+        out_act = self.activity.forward_second(f_act)
+
+        return {
+            "expression": out_exp,
+            "stability": out_stab,
+            "activity": out_act,
+        }
+
 
 
 class TransformerBlock(nn.Module):
@@ -107,6 +177,9 @@ class PLM(PreTrainedModel):
         self.lm_head = LMHead(config.hidden_size, config.vocab_size, config.soft_logit_cap)
         if config.tie_embeddings:
             self.lm_head.decoder.weight = self.embedding.weight
+
+        if config.property_prediction:
+            self.property_head = PropertyPredictor(config.hidden_size, use_cross_stitch=config.use_cross_stitch)
 
         self.ce = nn.CrossEntropyLoss()
         self.special_token_ids = self.get_special_token_ids()
@@ -163,6 +236,13 @@ class PLM(PreTrainedModel):
         # Stack into [num_documents, hidden_size]
         return torch.stack(doc_embeds, dim=0)
 
+    def predict_properties(self, input_ids: torch.Tensor) -> Optional[dict]:
+        """Return property predictions if property heads are enabled."""
+        if not hasattr(self, "property_head"):
+            return None
+        embeds = self.get_vector_embeddings(input_ids)
+        return self.property_head(embeds)
+
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         eps = 1e-3
         input_ids = input_ids.flatten()
@@ -195,17 +275,21 @@ class PLM(PreTrainedModel):
             input_ids[mask_indices].view(-1)) / p_mask[mask_indices]
         
         loss = token_loss.sum() / seq_len
+        props = None
+        if hasattr(self, "property_head"):
+            props = self.property_head(self.get_vector_embeddings(input_ids))
 
         return ESMOutput(
             loss=loss,
             logits=(lm_logits, labels),
             last_hidden_state=last_hidden_state,
+            properties=props,
         )
 
 
 if __name__ == "__main__":
     # py -m model.model
-    config = PLMConfig(p_attention=False)
+    config = PLMConfig(p_attention=False, property_prediction=True, use_cross_stitch=True)
     model = PLM(config).cuda()
     print(model)
 
@@ -215,3 +299,4 @@ if __name__ == "__main__":
     print(f"logits: {output.logits[0].shape}")
     print(f"labels: {output.logits[1].shape}")
     print(f"last_hidden_state: {output.last_hidden_state.shape}")
+    print("properties:", output.properties)
