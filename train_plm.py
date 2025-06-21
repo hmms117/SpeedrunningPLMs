@@ -16,7 +16,15 @@ from huggingface_hub import login, hf_hub_download
 from datasets import load_dataset, Dataset
 
 from model.model import PLM, PLMConfig
-from data.dataset_classes import SequenceDatasetFromList, SequenceCollator, IterableDatasetFromHF, TokenBasedSequenceCollator, TokenBasedIterableDataset
+from data.dataset_classes import (
+    SequenceDatasetFromList,
+    SequenceCollator,
+    IterableDatasetFromHF,
+    TokenBasedSequenceCollator,
+    TokenBasedIterableDataset,
+    LMDBSequenceDataset,
+    LMDBFeatureStore,
+)
 from custom_trainer import CustomTrainer
 
 
@@ -112,6 +120,10 @@ def parse_args():
     parser.add_argument("--sliding_window_size", type=int, default=2048, help="Sliding window size for PAttention")
     parser.add_argument("--target_token_count", type=int, default=8192, help="Target token count for training")
     parser.add_argument("--disable_muon", action="store_true", help="Disable Muon optimizer")
+    parser.add_argument("--numeric_feature_keys", nargs="*", default=None, help="Names of numeric feature columns")
+    parser.add_argument("--token_feature_keys", nargs="*", default=None, help="Names of token feature columns")
+    parser.add_argument("--token_lmdb_path", type=str, default=None, help="Path to LMDB containing tokenized sequences")
+    parser.add_argument("--feature_lmdb_path", type=str, default=None, help="Path to LMDB containing additional features")
     args = parser.parse_args()
     return args
 
@@ -133,13 +145,29 @@ def main(args):
     summary(model)
 
     ### Load Dataset
-    train_dataset = load_dataset("Synthyra/omg_prot50", split="train", streaming=True).shuffle(seed=42)
+    feature_store = LMDBFeatureStore(args.feature_lmdb_path) if args.feature_lmdb_path else None
+
+    if args.token_lmdb_path:
+        base_dataset = LMDBSequenceDataset(args.token_lmdb_path, feature_store)
+        feature_store = None
+        col_name = 'tokens'
+    else:
+        base_dataset = load_dataset("Synthyra/omg_prot50", split="train", streaming=True).shuffle(seed=42)
+        col_name = 'sequence'
     valid_seqs, test_seqs = get_eval_data()
     if args.bugfix:
         valid_seqs = valid_seqs[:10]
         test_seqs = test_seqs[:10]
-    
-    train_dataset = TokenBasedIterableDataset(train_dataset, target_token_count=args.target_token_count, col_name='sequence')
+
+    train_dataset = TokenBasedIterableDataset(
+        base_dataset,
+        target_token_count=args.target_token_count,
+        col_name=col_name,
+        numeric_feature_keys=args.numeric_feature_keys,
+        token_feature_keys=args.token_feature_keys,
+        feature_store=feature_store,
+        tokens_key='tokens',
+    )
     valid_dataset = SequenceDatasetFromList(valid_seqs)
     test_dataset = SequenceDatasetFromList(test_seqs)
     data_collator = TokenBasedSequenceCollator(tokenizer)

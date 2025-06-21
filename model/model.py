@@ -163,7 +163,9 @@ class PLM(PreTrainedModel):
         # Stack into [num_documents, hidden_size]
         return torch.stack(doc_embeds, dim=0)
 
-    def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def forward(self, input_ids: torch.Tensor,
+                numeric_features: Optional[torch.Tensor] = None,
+                token_features: Optional[torch.Tensor] = None) -> torch.Tensor:
         eps = 1e-3
         input_ids = input_ids.flatten()
         seq_len = len(input_ids)
