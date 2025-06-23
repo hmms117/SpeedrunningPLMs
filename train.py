@@ -29,6 +29,7 @@ from optimizer import Muon
 from dataloading import DistributedPaddedDataLoader
 from model.model import PLM, PLMConfig
 from model.utils import Linear
+from logger import get_logger
 
 
 @dataclass
@@ -105,22 +106,22 @@ def main(args, model_config):
     if master_process:
         run_id = uuid.uuid4()
         Path('logs').mkdir(exist_ok=True)
-        # logdir = Path('logs') / f'{run_id}'
-        # logdir.mkdir()
         logfile = Path('logs') / f'{run_id}.txt'
-        print(logfile.stem)
-        # create the log file
+        logger = get_logger('train', str(logfile))
+        logger.info(logfile.stem)
         with logfile.open('w') as f:
-            # begin the log by printing this file (the Python code)
             print(code, file=f)
             print('=' * 100, file=f)
+    else:
+        logger = get_logger(f'train_rank{ddp_rank}')
 
     def print0(s, logonly=False):
         if master_process:
-            with logfile.open('a') as f:
-                if not logonly:
-                    print(s)
-                print(s, file=f)
+            if logonly and logfile is not None:
+                with logfile.open('a') as f:
+                    print(s, file=f)
+            else:
+                logger.info(s)
 
     # log information about the hardware/software environment this is running on
     # and print the full `nvidia-smi` to file
