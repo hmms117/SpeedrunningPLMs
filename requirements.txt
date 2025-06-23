@@ -7,3 +7,4 @@ datasets
 torchinfo
 scikit-learn
 wandb
+colorama
